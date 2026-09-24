@@ -38,6 +38,7 @@ GLOSSARY = {
     "minor if found in any zone": "任意区域均为轻微",
     "major if found in any zone": "任意区域均为严重",
     "apparel": "服装", "category": "类别",
+    "caterory: apparel": "类别：服装", "category: apparel": "类别：服装",
     "critical if major if": "", "others (must specify in note)": "其他（须在备注中说明）",
 }
 
