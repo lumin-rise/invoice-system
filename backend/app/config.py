@@ -8,6 +8,8 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 THUMB_DIR = DATA_DIR / "thumbs"
 SESSION_FILE = DATA_DIR / "session.json"
 TRACKER_FILE = DATA_DIR / "tracker.xlsx"            # 上传的基准 Tracker list
+TRANSLATE_DIR = DATA_DIR / "translate"              # 翻译功能：原文 + 译文
+TRANSLATE_DIR.mkdir(parents=True, exist_ok=True)
 
 for p in (DATA_DIR, UPLOAD_DIR, THUMB_DIR):
     p.mkdir(parents=True, exist_ok=True)

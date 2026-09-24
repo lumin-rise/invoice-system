@@ -9,6 +9,10 @@
           <p>上传发票 → 自动解析 → 按时间排序 → 导出 Bills + Expenses report（原格式）</p>
         </div>
       </div>
+      <div class="tabs">
+        <button :class="{ tabbtn: true, active: page === 'invoice' }" @click="page = 'invoice'">发票解析</button>
+        <button :class="{ tabbtn: true, active: page === 'translate' }" @click="page = 'translate'">文档翻译</button>
+      </div>
       <div class="actions">
         <span class="user" :title="username">👤 {{ username }}</span>
         <button @click="pwOpen = true">修改密码</button>
@@ -20,6 +24,7 @@
       </div>
     </header>
 
+    <div v-show="page === 'invoice'">
     <!-- 上传区 -->
     <div
       class="dropzone card"
@@ -167,6 +172,10 @@
       </div>
     </section>
 
+    </div><!-- /page:invoice -->
+
+    <Translate v-show="page === 'translate'" @toast="showToast" />
+
     <!-- 修改密码 -->
     <teleport to="body">
       <div v-if="pwOpen" class="modal-mask" @click.self="pwOpen = false">
@@ -213,6 +222,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, ApiError } from './api'
 import Login from './Login.vue'
+import Translate from './Translate.vue'
 import {
   billNoOf, fileUrl, sorted, thumbUrl,
   type Invoice,
@@ -220,6 +230,7 @@ import {
 
 const authed = ref(false)
 const username = ref('')
+const page = ref<'invoice' | 'translate'>('invoice')
 const invoices = ref<Invoice[]>([])
 const drag = ref(false)
 const uploading = ref(0)
@@ -403,6 +414,9 @@ async function exportXlsx() {
 .brand h1 { font-size: 18px; margin: 0; }
 .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
 .actions { display: flex; gap: 10px; align-items: center; }
+.tabs { display: flex; gap: 6px; margin-left: 14px; }
+.tabbtn { border: none; background: transparent; color: var(--muted); font-size: 13.5px; padding: 8px 12px; border-radius: 8px; }
+.tabbtn.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .user { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
 
 .modal-mask { position: fixed; inset: 0; background: rgba(15,23,42,.5); display: flex; align-items: center; justify-content: center; z-index: 70; }

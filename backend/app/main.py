@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -24,7 +26,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import cleanup, config, pipeline, security, store
+from . import cleanup, config, doctranslate, pipeline, security, store, translators
 from .exporter import to_xlsx_bytes
 from .models import Invoice, InvoicePatch, sorted_invoices
 
@@ -293,6 +295,100 @@ def debug_parse(body: dict):
         "has_rail_fallback": hasattr(f, "rail_stations_from_lines"),
         "result": f.parse_fields(text),
     }
+
+
+# ---------------------------------------------------------------- 文档翻译
+
+@app.get("/api/translate/config")
+def translate_config():
+    return translators.config_summary()
+
+
+@app.post("/api/translate/config")
+async def translate_set_config(request: Request):
+    body = await request.json()
+    cfg = translators.load_config()
+    provider = body.get("provider")
+    if provider and provider not in translators.PROVIDERS:
+        raise HTTPException(400, "未知的服务商")
+    if provider is not None:
+        cfg["provider"] = provider
+    for prov, kv in (body.get("keys") or {}).items():
+        if prov not in translators.PROVIDERS:
+            continue
+        slot = cfg.setdefault("keys", {}).setdefault(prov, {})
+        for k, v in kv.items():
+            if v and "****" not in str(v):        # 前端回显的掩码不覆盖真实值
+                slot[k] = str(v).strip()
+    translators.save_config(cfg)
+    return translators.config_summary()
+
+
+@app.post("/api/translate/test")
+def translate_test():
+    return translators.test_engine()
+
+
+@app.get("/api/translate/list")
+def translate_list():
+    items = []
+    idx = store.load_translate_index()
+    for it in sorted(idx, key=lambda x: -x["created_at"]):
+        items.append({k: it[k] for k in ("id", "name", "created_at", "blocks", "download_name")})
+    return items
+
+
+@app.post("/api/translate/upload", response_model=dict)
+async def translate_upload(file: UploadFile = File(...)):
+    name = file.filename or "document"
+    ext = Path(name).suffix.lower()
+    if ext not in (".pdf", ".docx", ".doc"):
+        raise HTTPException(400, "仅支持 PDF / DOCX 文件")
+    if ext == ".doc":
+        raise HTTPException(400, "暂不支持旧版 .doc，请先另存为 .docx")
+    content = await file.read()
+    doc_id = uuid.uuid4().hex[:10]
+    src = config.TRANSLATE_DIR / f"{doc_id}_src{ext}"
+    src.write_bytes(content)
+    out = config.TRANSLATE_DIR / f"{doc_id}_cn.docx"
+    try:
+        blocks = doctranslate.translate_document(str(src), str(out), "pdf" if ext == ".pdf" else "docx")
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"翻译失败: {e}")
+    download_name = f"{Path(name).stem}-中文版.docx"
+    item = {"id": doc_id, "name": name, "created_at": time.time(),
+            "blocks": blocks, "download_name": download_name}
+    idx = store.load_translate_index()
+    idx.append(item)
+    store.save_translate_index(idx)
+    return item
+
+
+@app.get("/api/translate/download/{doc_id}")
+def translate_download(doc_id: str):
+    item = next((i for i in store.load_translate_index() if i["id"] == doc_id), None)
+    if not item:
+        raise HTTPException(404, "记录不存在")
+    path = config.TRANSLATE_DIR / f"{doc_id}_cn.docx"
+    if not path.exists():
+        raise HTTPException(404, "译文文件不存在")
+    return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        filename=item["download_name"])
+
+
+@app.delete("/api/translate/{doc_id}")
+def translate_delete(doc_id: str):
+    idx = store.load_translate_index()
+    keep = [i for i in idx if i["id"] != doc_id]
+    if len(keep) == len(idx):
+        raise HTTPException(404, "记录不存在")
+    store.save_translate_index(keep)
+    (config.TRANSLATE_DIR / f"{doc_id}_cn.docx").unlink(missing_ok=True)
+    for p in config.TRANSLATE_DIR.glob(f"{doc_id}_src.*"):
+        p.unlink(missing_ok=True)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- 前端静态资源

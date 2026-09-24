@@ -5,7 +5,7 @@ import json
 import threading
 from typing import Optional
 
-from .config import SESSION_FILE
+from .config import DATA_DIR, SESSION_FILE
 from .models import Invoice
 
 _lock = threading.Lock()
@@ -58,3 +58,21 @@ def remove(inv_id: str) -> bool:
 
 def clear() -> None:
     save_invoices([])
+
+
+# ---------------------------------------------------------------- 翻译文档索引
+
+INDEX_FILE = DATA_DIR / "translate_index.json"
+
+
+def load_translate_index() -> list[dict]:
+    if not INDEX_FILE.exists():
+        return []
+    try:
+        return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def save_translate_index(items: list[dict]) -> None:
+    INDEX_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
