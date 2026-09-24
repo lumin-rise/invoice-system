@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# 前端构建产物（部署时在容器/服务器上构建）
+frontend/dist/
+
+# 运行数据：发票原件、会话、登录凭据 —— 绝不入库
+backend/data/
+
+# 测试运行残留
+scripts/e2e_data/
+scripts/samples/
+scripts/fixtures/
+scripts/server.log
+scripts/export_test.xlsx
+scripts/layout_check.png
+
+# 系统杂项
+.DS_Store
+Thumbs.db

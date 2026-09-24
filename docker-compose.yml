@@ -1,0 +1,12 @@
+services:
+  invoice-system:
+    build: .
+    container_name: invoice-system
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/backend/data     # 发票原件/会话/凭据持久化
+    environment:
+      TZ: Asia/Shanghai
+      RETENTION_DAYS: "30"           # 自动清理保留期（天）

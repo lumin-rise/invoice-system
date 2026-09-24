@@ -1,0 +1,93 @@
+:root {
+  --bg: #f4f6f9;
+  --card: #ffffff;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2563eb;
+  --accent-soft: #eff6ff;
+  --danger: #dc2626;
+  --ok: #059669;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+button {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--ink);
+  transition: all .15s;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button.primary:hover { filter: brightness(1.1); color: #fff; }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+input, select {
+  font: inherit;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+  color: var(--ink);
+  width: 100%;
+}
+input:hover { border-color: var(--line); }
+input:focus { outline: none; border-color: var(--accent); background: #fff; }
+input[type="date"], input[type="time"] { font-family: inherit; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
+}
+
+.section { margin: 18px; }
+.section h2 {
+  font-size: 16px;
+  margin: 0 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.section h2 .tag {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.badge.gray { background: #f3f4f6; color: var(--muted); }
+.badge.warn { background: #fef3c7; color: #b45309; }
+
+.empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 40px 0;
+}
