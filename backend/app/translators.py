@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -85,7 +86,8 @@ def save_config_from(body: dict) -> dict:
 
 # ---------------------------------------------------------------- MyMemory 请求
 
-def _mm_once(text: str, email: str) -> str:
+def _mm_request(text: str, email: str) -> str:
+    """单次请求（带限频退避重试）。"""
     params = {"langpair": "en|zh-CN", "q": text}
     if email:
         params["de"] = email
@@ -97,7 +99,7 @@ def _mm_once(text: str, email: str) -> str:
             with urllib.request.urlopen(req, timeout=25) as r:
                 data = json.loads(r.read().decode("utf-8"))
             if data.get("responseStatus") != 200 or data.get("quotaFinished"):
-                raise RuntimeError(f"MyMemory 接口受限：{data.get('responseDetails') or '今日免费额度已用完'}")
+                raise RuntimeError(f"MyMemory 免费额度受限：{data.get('responseDetails') or '今日额度已用完，明天再试或在设置里填写邮箱提升额度'}")
             return html.unescape(data["responseData"]["translatedText"])
         except RuntimeError:
             raise                                   # 额度类错误重试无意义
@@ -130,7 +132,8 @@ _pool = ThreadPoolExecutor(max_workers=WORKERS)
 
 
 def translate_many(texts: list[str]) -> list[str]:
-    """批量翻译，返回与输入一一对应的中文（含术语表命中与缓存）。"""
+    """批量翻译：多条短段拼接为一次请求（换行分隔，实测行数可完整保留），
+    拆回后行数不符才降级逐条；术语表命中与缓存不发请求。"""
     email = load_config().get("email", "")
     todo: list[str] = []
     seen: set[str] = set()
@@ -143,17 +146,44 @@ def translate_many(texts: list[str]) -> list[str]:
             todo.append(t)
 
     if todo:
-        jobs: list[str] = []
+        # 把每个待译文本切成 ≤480 字符的片段，凑成若干组（每组总长 ≤480），
+        # 一组 = 一次请求（组内片段以换行分隔，MyMemory 可完整保留行数）
+        part_text: list[str] = []
+        todo_parts: list[list[int]] = []
+        groups: list[list[int]] = []
+        cur: list[int] = []
+        size = 0
         for t in todo:
-            jobs.extend(_split_long(t))
-        parts = list(_pool.map(lambda s: _mm_once(s, email), jobs))
-        merged, idx = [], 0
-        for t in todo:
-            n = len(_split_long(t))
-            merged.append(" ".join(parts[idx:idx + n]))
-            idx += n
-        for src, dst in zip(todo, merged):
-            _cache[src] = dst
+            mine: list[int] = []
+            for piece in _split_long(t):
+                pi = len(part_text)
+                part_text.append(piece)
+                mine.append(pi)
+                n = len(piece) + 1
+                if cur and size + n > MAX_QUERY:
+                    groups.append(cur)
+                    cur, size = [], 0
+                cur.append(pi)
+                size += n
+            todo_parts.append(mine)
+        if cur:
+            groups.append(cur)
+
+        def run_group(idxs: list[int]) -> dict[int, str]:
+            joined = "\n".join(part_text[i] for i in idxs)
+            out = _mm_request(joined, email)
+            lines = [l.strip() for l in out.split("\n")]
+            if len(lines) != len(idxs):             # 行数错位 → 该组逐条兜底
+                return {i: _mm_request(part_text[i], email) for i in idxs}
+            return {i: l for i, l in zip(idxs, lines)}
+
+        part_results: dict[int, str] = {}
+        for res in _pool.map(run_group, groups):
+            part_results.update(res)
+
+        # 按片段归属拼回每个文本的译文
+        for t, mine in zip(todo, todo_parts):
+            _cache[t] = " ".join(part_results[pi] for pi in mine)
 
     out = []
     for t in texts:
