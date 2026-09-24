@@ -20,7 +20,7 @@ from .config import DATA_DIR
 CONFIG_FILE = DATA_DIR / "translate_config.json"
 
 MAX_QUERY = 480          # MyMemory 单请求上限 500 字符
-WORKERS = 8              # 并发线程数
+WORKERS = 4              # 并发线程数（太高会触发 429 限频）
 
 # ---------------------------------------------------------------- 内置术语表
 
@@ -90,11 +90,21 @@ def _mm_once(text: str, email: str) -> str:
     if email:
         params["de"] = email
     url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=25) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    if data.get("responseStatus") != 200 or data.get("quotaFinished"):
-        raise RuntimeError(f"MyMemory 接口受限：{data.get('responseDetails') or '今日免费额度已用完'}")
-    return html.unescape(data["responseData"]["translatedText"])
+    last_err: Exception | None = None
+    for attempt in range(6):                       # 429/网络抖动指数退避重试
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            if data.get("responseStatus") != 200 or data.get("quotaFinished"):
+                raise RuntimeError(f"MyMemory 接口受限：{data.get('responseDetails') or '今日免费额度已用完'}")
+            return html.unescape(data["responseData"]["translatedText"])
+        except RuntimeError:
+            raise                                   # 额度类错误重试无意义
+        except Exception as e:                      # 429 / 超时 / 连接重置
+            last_err = e
+            time.sleep(min(20, 1.5 * (2 ** attempt)))
+    raise RuntimeError(f"翻译请求多次失败: {last_err}")
 
 
 def _split_long(text: str, limit: int = MAX_QUERY) -> list[str]:
