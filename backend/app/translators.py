@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -21,7 +22,19 @@ from .config import DATA_DIR
 CONFIG_FILE = DATA_DIR / "translate_config.json"
 
 MAX_QUERY = 480          # MyMemory 单请求上限 500 字符
-WORKERS = 4              # 并发线程数（太高会触发 429 限频）
+WORKERS = 2              # 并发组数（配全局间隔阀，避免触发 429 限频）
+MIN_INTERVAL = 0.9       # 相邻请求最小间隔（秒）
+
+_stagger_lock = threading.Lock()
+_last_req = [0.0]
+
+
+def _throttle():
+    with _stagger_lock:
+        wait = _last_req[0] + MIN_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_req[0] = time.time()
 
 # ---------------------------------------------------------------- 内置术语表
 
@@ -94,8 +107,9 @@ def _mm_request(text: str, email: str) -> str:
         params["de"] = email
     url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(params)
     last_err: Exception | None = None
-    for attempt in range(6):                       # 429/网络抖动指数退避重试
+    for attempt in range(8):                       # 429/网络抖动：退避最长 60s
         try:
+            _throttle()
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=25) as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -106,8 +120,8 @@ def _mm_request(text: str, email: str) -> str:
             raise                                   # 额度类错误重试无意义
         except Exception as e:                      # 429 / 超时 / 连接重置
             last_err = e
-            time.sleep(min(20, 1.5 * (2 ** attempt)))
-    raise RuntimeError(f"翻译请求多次失败: {last_err}")
+            time.sleep(min(60, 5 * (2 ** attempt)))
+    raise RuntimeError(f"翻译请求多次失败: {last_err}（免费接口限频，请稍后再试）")
 
 
 def _split_long(text: str, limit: int = MAX_QUERY) -> list[str]:
