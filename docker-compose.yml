@@ -1,6 +1,11 @@
 services:
   invoice-system:
-    build: .
+    build:
+      context: .
+      args:
+        # 国内服务器构建加速；海外构建删掉这两行即可
+        NPM_REGISTRY: https://registry.npmmirror.com
+        PIP_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple
     container_name: invoice-system
     restart: unless-stopped
     ports:
