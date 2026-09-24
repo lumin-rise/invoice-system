@@ -3,7 +3,7 @@
     <!-- 翻译服务设置 -->
     <section class="section card">
       <h2>翻译设置
-        <span class="tag">填写任一服务商密钥后即可使用；推荐腾讯云机器翻译（每月 500 万字符免费）</span>
+        <span class="tag">默认使用免费 MyMemory 引擎，开箱即用；追求更高质量可配置腾讯云机器翻译（每月500万字免费）</span>
         <button class="testbtn" @click="testEngine" :disabled="testing">
           {{ testing ? '测试中…' : '测试连接' }}
         </button>
@@ -15,7 +15,12 @@
             <option v-for="(desc, key) in cfg.providers" :key="key" :value="key">{{ key }} — {{ desc }}</option>
           </select>
         </label>
-        <template v-if="cfg.provider === 'tencent'">
+        <template v-if="cfg.provider === 'mymemory'">
+          <label>通知邮箱（选填，可将每日免费额度从 5 千提升到 5 万字符）
+            <input v-model="keys.mymemory.email" placeholder="your@email.com" />
+          </label>
+        </template>
+        <template v-else-if="cfg.provider === 'tencent'">
           <label>SecretId <input v-model="keys.tencent.secret_id" placeholder="腾讯云 API 密钥 ID" /></label>
           <label>SecretKey <input v-model="keys.tencent.secret_key" type="password" placeholder="腾讯云 API 密钥 Key" /></label>
         </template>

@@ -1,19 +1,24 @@
 """翻译引擎层：多服务商 + 内存缓存。
 
-支持的服务商（通过 data/config.json 配置，页面「翻译设置」里填写）：
-- tencent  腾讯云机器翻译 TMT（每月 500 万字符免费，国内最稳）  需要 SecretId/SecretKey
-- baidu    百度翻译开放平台（标准版每月 5 万字符免费）          需要 APP_ID/APP_KEY
-- deepl    DeepL Free（每月 50 万字符，国内网络不一定可达）     需要 API Key
-- bing     Bing 免费接口（无需 key，国内网络大多不可达，备选）
+- mymemory  MyMemory 免费接口（无需密钥，默认引擎；长句质量一般，日限 5 万字符）
+- tencent   腾讯云机器翻译 TMT（每月 500 万字符免费，国内最稳，推荐追求质量时用）
+- baidu     百度翻译开放平台（标准版每月 5 万字符免费）
+- deepl     DeepL Free（每月 50 万字符，国内网络不一定可达）
+- bing      Bing 免费接口（无需 key，国内网络大多不可达，备选）
 
 统一入口：translate_many(texts: list[str]) -> list[str]
+未配置服务商时自动使用免费的 mymemory。
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
+import re
 import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -24,11 +29,16 @@ from .config import DATA_DIR
 CONFIG_FILE = DATA_DIR / "translate_config.json"
 
 PROVIDERS = {
-    "tencent": "腾讯云机器翻译（500万字/月免费）",
+    "mymemory": "MyMemory 免费接口（无需密钥，开箱即用）",
+    "tencent": "腾讯云机器翻译（500万字/月免费，更精准）",
     "baidu": "百度翻译开放平台（5万字/月免费）",
     "deepl": "DeepL Free（50万字/月）",
-    "bing": "Bing 免费接口（无需 key）",
+    "bing": "Bing 免费接口（无需 key，备选）",
 }
+
+# 各引擎单次请求的字符上限
+ENGINE_LIMITS = {"mymemory": 480, "tencent": 1800, "baidu": 1800, "deepl": 1800, "bing": 1800}
+DEFAULT_PROVIDER = "mymemory"
 
 _cache: dict[str, str] = {}
 
@@ -146,14 +156,62 @@ def _bing(texts: list[str], cfg: dict) -> list[str]:
     return [d["translations"][0]["text"] for d in data]
 
 
-ENGINES = {"tencent": _tencent, "baidu": _baidu, "deepl": _deepl, "bing": _bing}
+def _mymemory_one(text: str, email: str) -> str:
+    params = {"langpair": "en|zh-CN", "q": text}
+    if email:
+        params["de"] = email          # 提供邮箱可将每日免费额度提升到 5 万字符
+    url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if data.get("responseStatus") != 200 or data.get("quotaFinished"):
+        raise RuntimeError(f"MyMemory: {data.get('responseDetails') or '配额或请求受限'}")
+    return html.unescape(data["responseData"]["translatedText"])
+
+
+def _split_long(text: str, limit: int) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for seg in re.split(r"(?<=[.。;;!!？？])", text):
+        if not seg:
+            continue
+        if len(cur) + len(seg) <= limit:
+            cur += seg
+        else:
+            if cur:
+                parts.append(cur)
+            cur = seg
+    if cur:
+        parts.append(cur)
+    return parts or [text[:limit]]
+
+
+def _mymemory(texts: list[str], cfg: dict) -> list[str]:
+    """单请求限 500 字符 → 逐段请求 + 4 线程并发。"""
+    email = _key(cfg, "mymemory", "email")
+    jobs = []
+    for t in texts:
+        jobs.extend(_split_long(t, 480))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        parts = list(pool.map(lambda s: _mymemory_one(s, email), jobs))
+    # 按切分前的分段合并
+    out, idx = [], 0
+    for t in texts:
+        n = len(_split_long(t, 480))
+        out.append(" ".join(parts[idx:idx + n]))
+        idx += n
+    return out
+
+
+ENGINES = {"mymemory": _mymemory, "tencent": _tencent, "baidu": _baidu,
+           "deepl": _deepl, "bing": _bing}
 
 
 def _chunks(texts: list[str], limit: int = 1800):
     """按字符长度分批（各引擎单请求都有上限）。"""
     batch, size = [], 0
     for t in texts:
-        n = len(t)
+        n = min(len(t), limit)
         if batch and size + n > limit:
             yield batch
             batch, size = [], 0
@@ -166,18 +224,15 @@ def _chunks(texts: list[str], limit: int = 1800):
 def translate_many(texts: list[str]) -> list[str]:
     """批量翻译（去重 + 缓存 + 分批调用）。texts 与返回一一对应。"""
     cfg = load_config()
-    provider = cfg.get("provider")
-    if not provider or provider not in ENGINES:
-        raise RuntimeError("尚未配置翻译服务：请在「翻译设置」中选择服务商并填写密钥")
+    provider = cfg.get("provider") or DEFAULT_PROVIDER
+    if provider not in ENGINES:
+        raise RuntimeError(f"未知的服务商: {provider}")
 
     uniq = list(dict.fromkeys(t for t in texts if t.strip()))
-    for t in uniq:
-        if t in _cache:
-            continue
     todo = [t for t in uniq if t not in _cache]
 
     engine = ENGINES[provider]
-    for batch in _chunks(todo):
+    for batch in _chunks(todo, ENGINE_LIMITS.get(provider, 1800)):
         result = engine(batch, cfg)
         if len(result) != len(batch):
             raise RuntimeError(f"翻译服务返回条数不符（{len(batch)}→{len(result)}）")
@@ -188,9 +243,7 @@ def translate_many(texts: list[str]) -> list[str]:
 
 def test_engine() -> dict:
     cfg = load_config()
-    provider = cfg.get("provider")
-    if not provider:
-        return {"ok": False, "msg": "未配置翻译服务"}
+    provider = cfg.get("provider") or DEFAULT_PROVIDER
     sample = ["Quality defect classification standard"]
     try:
         out = translate_many(sample)
