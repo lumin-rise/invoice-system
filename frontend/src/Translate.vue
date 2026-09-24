@@ -1,45 +1,21 @@
 <template>
   <div>
-    <!-- 翻译服务设置 -->
+    <!-- 引擎设置（免费，无需密钥） -->
     <section class="section card">
-      <h2>翻译设置
-        <span class="tag">默认使用免费 MyMemory 引擎，开箱即用；追求更高质量可配置腾讯云机器翻译（每月500万字免费）</span>
+      <h2>翻译引擎
+        <span class="tag">MyMemory 免费接口，无需任何密钥；填邮箱可将每日额度从 5 千提升到 5 万字符</span>
         <button class="testbtn" @click="testEngine" :disabled="testing">
           {{ testing ? '测试中…' : '测试连接' }}
         </button>
       </h2>
       <div class="cfg">
-        <label>服务商
-          <select v-model="cfg.provider">
-            <option value="">（未选择）</option>
-            <option v-for="(desc, key) in cfg.providers" :key="key" :value="key">{{ key }} — {{ desc }}</option>
-          </select>
+        <label>通知邮箱（选填）
+          <input v-model="email" placeholder="your@email.com" />
         </label>
-        <template v-if="cfg.provider === 'mymemory'">
-          <label>通知邮箱（选填，可将每日免费额度从 5 千提升到 5 万字符）
-            <input v-model="keys.mymemory.email" placeholder="your@email.com" />
-          </label>
-        </template>
-        <template v-else-if="cfg.provider === 'tencent'">
-          <label>SecretId <input v-model="keys.tencent.secret_id" placeholder="腾讯云 API 密钥 ID" /></label>
-          <label>SecretKey <input v-model="keys.tencent.secret_key" type="password" placeholder="腾讯云 API 密钥 Key" /></label>
-        </template>
-        <template v-else-if="cfg.provider === 'baidu'">
-          <label>APP ID <input v-model="keys.baidu.app_id" placeholder="百度翻译 APP ID" /></label>
-          <label>APP KEY <input v-model="keys.baidu.app_key" type="password" placeholder="百度翻译密钥" /></label>
-        </template>
-        <template v-else-if="cfg.provider === 'deepl'">
-          <label>API Key <input v-model="keys.deepl.api_key" type="password" placeholder="DeepL API Key" /></label>
-        </template>
-        <template v-else-if="cfg.provider === 'bing'">
-          <p class="tip">Bing 免费接口无需密钥，但国内网络大多无法访问，仅作备选。</p>
-        </template>
-        <div>
-          <button class="primary" @click="saveCfg" :disabled="saving">{{ saving ? '保存中…' : '保存设置' }}</button>
-          <span v-if="testResult" :class="['result', testResult.ok ? 'ok' : 'bad']">
-            {{ testResult.ok ? `✓ 连接成功，示例：${testResult.sample}` : '✗ ' + testResult.msg }}
-          </span>
-        </div>
+        <button class="primary" @click="saveCfg" :disabled="saving">{{ saving ? '保存中…' : '保存' }}</button>
+        <span v-if="testResult" :class="['result', testResult.ok ? 'ok' : 'bad']">
+          {{ testResult.ok ? `✓ 引擎正常，示例：${testResult.sample}` : '✗ ' + testResult.msg }}
+        </span>
       </div>
     </section>
 
@@ -50,12 +26,12 @@
              @change="e => onPick((e.target as HTMLInputElement).files)" />
       <div v-if="!busy" class="dz-inner">
         <div class="dz-icon">🌐</div>
-        <b>拖入 PDF 或 Word 文档，翻译成中文</b>
-        <p>输出为 .docx（保留标题与表格结构）；旧版 .doc 请先另存为 .docx</p>
+        <b>拖入 PDF 或 Word 文档，翻译成中文（原文+译文对照）</b>
+        <p>可在线浏览，也可下载双语 Word；旧版 .doc 请先另存为 .docx</p>
       </div>
       <div v-else class="dz-inner">
         <div class="spinner"></div>
-        <b>正在翻译，请稍候…（取决于文档大小与翻译接口限频）</b>
+        <b>正在翻译（{{ progress }}），完成后自动出现在下方列表…</b>
       </div>
     </div>
 
@@ -68,77 +44,121 @@
           <tr v-for="it in list" :key="it.id">
             <td class="name">{{ it.name }}</td>
             <td class="date">{{ new Date(it.created_at * 1000).toLocaleString() }}</td>
-            <td class="meta">{{ it.blocks }} 个段落/表格块</td>
+            <td class="meta">{{ it.blocks }} 块</td>
             <td class="ops">
-              <a class="btn" :href="`/api/translate/download/${it.id}`">下载中文版</a>
+              <button class="btn" @click="read(it)">在线浏览</button>
+              <a class="btn" :href="`/api/translate/download/${it.id}`">下载双语 Word</a>
               <button class="danger del" @click="del(it)">删除</button>
             </td>
           </tr>
         </tbody>
       </table>
     </section>
+
+    <!-- 在线阅读器 -->
+    <teleport to="body">
+      <div v-if="reader" class="reader-mask" @click.self="reader = null">
+        <div class="reader">
+          <div class="rd-head">
+            <b>{{ reader.name }}</b>
+            <div class="rd-tools">
+              <button :class="{ on: !onlyCn }" @click="onlyCn = false">双语</button>
+              <button :class="{ on: onlyCn }" @click="onlyCn = true">仅中文</button>
+              <a class="btn" :href="`/api/translate/download/${reader.id}`">下载 Word</a>
+              <button @click="reader = null">✕</button>
+            </div>
+          </div>
+          <div class="rd-body">
+            <template v-for="(b, i) in reader.content" :key="i">
+              <h3 v-if="b.type === 'heading'" :class="'lv' + b.level">
+                {{ b.dst }}<span v-if="!onlyCn && b.src" class="src"> {{ b.src }}</span>
+              </h3>
+              <div v-else-if="b.type === 'para'" class="para">
+                <p class="dst">{{ b.dst }}</p>
+                <p v-if="!onlyCn && b.src" class="src">{{ b.src }}</p>
+              </div>
+              <table v-else class="tbl">
+                <tr v-for="(row, ri) in b.cells" :key="ri">
+                  <td v-for="(c, ci) in row" :key="ci">
+                    <div class="dst">{{ c.dst }}</div>
+                    <div v-if="!onlyCn && c.src && c.src !== c.dst" class="src">{{ c.src }}</div>
+                  </td>
+                </tr>
+              </table>
+            </template>
+          </div>
+        </div>
+      </div>
+    </teleport>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { api, ApiError } from './api'
 
 interface TxItem { id: string; name: string; created_at: number; blocks: number; download_name: string }
 
-const cfg = reactive<any>({ provider: '', providers: {} })
-const keys = reactive<any>({ tencent: {}, baidu: {}, deepl: {}, bing: {} })
+const email = ref('')
 const testing = ref(false), saving = ref(false), busy = ref(false), drag = ref(false)
 const testResult = ref<any>(null)
 const list = ref<TxItem[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
+const reader = ref<any>(null)
+const onlyCn = ref(false)
+const progress = ref('')
+const emit = defineEmits<{ (e: 'toast', m: string): void }>()
 
-const load = () => api.translateConfig().then((r: any) => {
-  cfg.provider = r.provider; cfg.providers = r.providers
-  for (const p of Object.keys(keys)) keys[p] = { ...(r.keys?.[p] || {}) }
-})
+const load = () => api.translateConfig().then((r: any) => (email.value = r.email || ''))
 const loadList = () => api.translateList().then(r => (list.value = r))
 onMounted(() => { load(); loadList() })
 
 async function saveCfg() {
   saving.value = true
-  try {
-    const r = await api.saveTranslateConfig({ provider: cfg.provider, keys })
-    cfg.provider = r.provider
-    testResult.value = null
-    showToastSafe('设置已保存')
-  } catch (e) { showToastSafe('保存失败：' + (e as ApiError).message) } finally { saving.value = false }
+  try { await api.saveTranslateConfig({ email: email.value }); emit('toast', '已保存') }
+  catch (e) { emit('toast', '保存失败：' + (e as ApiError).message) } finally { saving.value = false }
 }
 async function testEngine() {
   testing.value = true
-  try { testResult.value = await api.testTranslateEngine() } catch (e) { testResult.value = { ok: false, msg: (e as ApiError).message } } finally { testing.value = false }
+  try { testResult.value = await api.testTranslateEngine() }
+  catch (e) { testResult.value = { ok: false, msg: (e as ApiError).message } }
+  finally { testing.value = false }
 }
-
-const emit = defineEmits<{ (e: 'toast', m: string): void }>()
-const showToastSafe = (m: string) => emit('toast', m)
 
 async function uploadOne(file: File) {
   busy.value = true
+  progress.value = '提取文本并调用翻译接口'
+  const timer = setInterval(() => { progress.value += '…' }, 3000)
   try {
     const item = await api.translateUpload(file)
     await loadList()
     emit('toast', `翻译完成：${item.download_name}`)
-  } catch (e) { emit('toast', '翻译失败：' + (e as ApiError).message) } finally { busy.value = false }
+    const fresh = list.value.find(x => x.id === item.id)
+    if (fresh) read(fresh)          // 完成后直接打开在线浏览
+  } catch (e) {
+    emit('toast', '翻译失败：' + (e as ApiError).message)
+  } finally { clearInterval(timer); busy.value = false }
 }
 const onDrop = (e: DragEvent) => { drag.value = false; const f = e.dataTransfer?.files?.[0]; if (f) uploadOne(f) }
 const onPick = (files: FileList | null) => { if (files?.length) uploadOne(files[0]) }
+
+async function read(it: TxItem) {
+  try {
+    const data = await api.translateContent(it.id)
+    reader.value = { id: it.id, name: data.name, content: data.content }
+  } catch (e) { emit('toast', (e as ApiError).message) }
+}
 async function del(it: TxItem) {
   await api.translateDelete(it.id); await loadList()
 }
 </script>
 
 <style scoped>
-.cfg { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
-.cfg label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); min-width: 200px; flex: 1; }
-.cfg input, .cfg select { border-color: var(--line); background: #fff; padding: 8px; }
-.tip { color: var(--muted); font-size: 12px; margin: 0; }
+.cfg { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.cfg label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); min-width: 260px; }
+.cfg input { border-color: var(--line); background: #fff; padding: 8px; }
 .testbtn { margin-left: auto; font-size: 12px; }
-.result { font-size: 12.5px; align-self: center; }
+.result { font-size: 12.5px; }
 .result.ok { color: var(--ok); }
 .result.bad { color: var(--danger); }
 .dropzone { margin: 18px 0 0; border: 2px dashed var(--line); border-radius: var(--radius); cursor: pointer; transition: all .15s; }
@@ -153,7 +173,24 @@ td { border-bottom: 1px solid var(--line); padding: 9px 8px; font-size: 13px; }
 .name { font-weight: 600; }
 .date, .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .ops { text-align: right; white-space: nowrap; }
-.btn { color: var(--accent); text-decoration: none; margin-right: 10px; }
+.btn { color: var(--accent); text-decoration: none; background: none; border: none; cursor: pointer; margin-right: 10px; font-size: 12.5px; }
+.btn:hover { text-decoration: underline; }
 .del { font-size: 12px; }
 .empty { text-align: center; color: var(--muted); padding: 26px 0; }
+
+.reader-mask { position: fixed; inset: 0; background: rgba(15,23,42,.6); z-index: 70; display: flex; align-items: center; justify-content: center; }
+.reader { background: #fff; width: min(920px, 94vw); height: min(86vh, 1000px); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+.rd-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.rd-tools { display: flex; gap: 8px; align-items: center; }
+.rd-tools .on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.rd-tools button, .rd-tools a { font-size: 12.5px; padding: 5px 10px; }
+.rd-body { overflow-y: auto; padding: 22px 30px; }
+.rd-body h3 { margin: 20px 0 8px; color: var(--ink); }
+.rd-body h3.lv1 { font-size: 19px; }
+.rd-body h3.lv2 { font-size: 16px; }
+.para { margin: 10px 0; }
+.dst { font-size: 14px; line-height: 1.7; }
+.src { color: #9ca3af; font-size: 11.5px; line-height: 1.5; }
+.tbl { width: 100%; border-collapse: collapse; margin: 12px 0; }
+.tbl td { border: 1px solid var(--line); padding: 7px 9px; vertical-align: top; font-size: 12.5px; line-height: 1.55; }
 </style>

@@ -1,52 +1,36 @@
-"""文档翻译：PDF / Word → 中文 Word。
+"""文档翻译：PDF / Word → 原文+译文对照（在线浏览 + 双语 Word 下载）。
 
 - PDF：pdfplumber 逐页提取「表格 + 表格外文本」，大字号文本识别为标题
 - Word：python-docx 按文档顺序遍历段落与表格
-- 输出：.docx（保留标题层级与表格结构，正文全部翻译为中文）
+- 内容结构（可 JSON 序列化，供在线阅读器使用）：
+    ("heading", level, src, dst)
+    ("para",    src, dst)
+    ("table",   src_rows, dst_rows)
 """
 from __future__ import annotations
 
 import re
 
-import pdfplumber
 import docx
+import pdfplumber
 from docx import Document
+from docx.shared import Pt, RGBColor
 
 from . import translators
 
 
 def _needs_translation(t: str) -> bool:
-    """空串/纯数字符号不用翻译。"""
-    t = (t or "").strip()
-    if not t:
-        return False
-    return bool(re.search(r"[A-Za-z\u00c0-\u024f]", t))
+    return translators.is_translatable(t or "")
 
 
-def _collect(blocks: list[tuple]) -> list[str]:
-    texts: list[str] = []
-    for kind, *rest in blocks:
-        if kind == "table":
-            for row in rest[0]:
-                for cell in row:
-                    if _needs_translation(cell or ""):
-                        texts.append(cell.strip())
-        else:
-            t = rest[0]
-            if _needs_translation(t):
-                texts.append(t.strip())
-    return texts
-
-
-def _apply(blocks: list[tuple], mapping: dict[str, str]) -> list[tuple]:
+def _map_cells(rows_src: list[list[str]], rows_dst: list[list[str]]) -> list[dict]:
+    """把原文行/译文行组装成在线阅读用的单元格结构。"""
     out = []
-    for kind, *rest in blocks:
-        if kind == "table":
-            new_rows = [[mapping.get((c or "").strip(), c or "") for c in row] for row in rest[0]]
-            out.append(("table", new_rows))
-        else:
-            t = rest[0]
-            out.append((kind, mapping.get(t.strip(), t), *rest[1:]))
+    for rs, rd in zip(rows_src, rows_dst):
+        out.append([
+            {"src": (s or ""), "dst": (d or "")}
+            for s, d in zip(rs, rd)
+        ])
     return out
 
 
@@ -63,7 +47,6 @@ def extract_pdf(path: str) -> list[tuple]:
                 mid = (word["top"] + word["bottom"]) / 2
                 return any(t0 - 2 <= mid <= t1 + 2 for t0, t1 in tboxes)
 
-            # 表格外的文本：按行分组，大字号当标题
             words = [w for w in page.extract_words(extra_attrs=["size"]) if not in_table(w)]
             lines: dict[int, list] = {}
             for w in words:
@@ -96,7 +79,7 @@ def extract_docx(path: str) -> list[tuple]:
     blocks: list[tuple] = []
     try:
         items = list(doc.iter_inner_content())
-    except AttributeError:                     # 旧版 python-docx：退化为先段落后台账
+    except AttributeError:
         items = list(doc.paragraphs) + list(doc.tables)
     for item in items:
         if isinstance(item, docx.table.Table):
@@ -119,35 +102,103 @@ def extract_docx(path: str) -> list[tuple]:
     return blocks
 
 
-# ---------------------------------------------------------------- 生成 docx
+# ---------------------------------------------------------------- 翻译 + 重组
 
-def build_docx(blocks: list[tuple], out_path: str) -> None:
-    doc = Document()
-    doc.add_heading("文档中文翻译", level=0)
+def _collect(blocks: list[tuple]) -> list[str]:
+    texts: list[str] = []
+    for kind, *rest in blocks:
+        if kind == "table":
+            for row in rest[0]:
+                for cell in row:
+                    if _needs_translation(cell):
+                        texts.append(cell.strip())
+        else:
+            t = rest[0]
+            if _needs_translation(t):
+                texts.append(t.strip())
+    return texts
+
+
+def translate_blocks(blocks: list[tuple]) -> list[dict]:
+    """翻译并返回在线阅读用的结构化内容（原文+译文对照）。"""
+    texts = _collect(blocks)
+    mapping = dict(zip(texts, translators.translate_many(texts)))
+
+    content: list[dict] = []
     for kind, *rest in blocks:
         if kind == "heading":
-            doc.add_heading(rest[0], level=min(rest[1] or 1, 3))
+            src, level = rest[0], rest[1]
+            content.append({"type": "heading", "level": level,
+                            "src": src, "dst": mapping.get(src.strip(), src)})
         elif kind == "para":
-            doc.add_paragraph(rest[0])
-        elif kind == "table":
-            rows = rest[0]
-            cols = max(len(r) for r in rows)
-            table = doc.add_table(rows=len(rows), cols=cols)
+            src = rest[0]
+            content.append({"type": "para",
+                            "src": src, "dst": mapping.get(src.strip(), src)})
+        else:
+            src_rows = rest[0]
+            dst_rows = [[mapping.get(c.strip(), c) for c in row] for row in src_rows]
+            content.append({"type": "table", "cells": _map_cells(src_rows, dst_rows)})
+    return content
+
+
+# ---------------------------------------------------------------- 生成双语 docx
+
+def _add_pair(doc, dst: str, src: str, heading_level: int | None = None):
+    """译文为主，原文以灰色小字附在下方。"""
+    if heading_level:
+        if dst:
+            doc.add_heading(dst, level=min(heading_level, 3))
+        if src:
+            p = doc.add_paragraph()
+            run = p.add_run(src)
+            run.font.size = Pt(10)
+            run.font.color.rgb = RGBColor(0x7F, 0x7F, 0x7F)
+        return
+    p = doc.add_paragraph()
+    if dst:
+        p.add_run(dst)
+    if src:
+        p2 = doc.add_paragraph()
+        run = p2.add_run(src)
+        run.font.size = Pt(9.5)
+        run.font.color.rgb = RGBColor(0x8C, 0x8C, 0x8C)
+
+
+def build_docx(content: list[dict], out_path: str, title: str = "") -> None:
+    doc = Document()
+    doc.add_heading(title or "文档中文翻译", level=0)
+    for b in content:
+        if b["type"] == "heading":
+            _add_pair(doc, b["dst"], b["src"], heading_level=b["level"])
+        elif b["type"] == "para":
+            _add_pair(doc, b["dst"], b["src"])
+        elif b["type"] == "table":
+            cells = b["cells"]
+            cols = max(len(r) for r in cells)
+            table = doc.add_table(rows=len(cells), cols=cols)
             table.style = "Table Grid"
-            for i, row in enumerate(rows):
+            for i, row in enumerate(cells):
                 for j in range(cols):
-                    table.cell(i, j).text = row[j] if j < len(row) else ""
+                    cell = table.cell(i, j) if j < len(row) else None
+                    if cell is None:
+                        continue
+                    pair = row[j] if j < len(row) else {"src": "", "dst": ""}
+                    p = cell.paragraphs[0]
+                    p.add_run(pair.get("dst", ""))
+                    if pair.get("src"):
+                        p.add_run().add_break()
+                        run = p.add_run(pair["src"])
+                        run.font.size = Pt(9)
+                        run.font.color.rgb = RGBColor(0x8C, 0x8C, 0x8C)
             doc.add_paragraph()
     doc.save(out_path)
 
 
 # ---------------------------------------------------------------- 入口
 
-def translate_document(src: str, out_path: str, source_type: str) -> int:
-    """翻译文档并输出中文 docx，返回处理的块数。"""
+def translate_document(src: str, out_path: str, source_type: str, title: str = "") -> tuple[list[dict], int]:
+    """翻译文档：输出双语 docx，返回 (在线阅读内容, 段落/表格块数)。"""
     blocks = extract_pdf(src) if source_type == "pdf" else extract_docx(src)
-    texts = _collect(blocks)
-    mapping = dict(zip(texts, translators.translate_many(texts)))
-    blocks = _apply(blocks, mapping)
-    build_docx(blocks, out_path)
-    return len(blocks)
+    content = translate_blocks(blocks)
+    build_docx(content, out_path, title=title)
+    return content, len(content)

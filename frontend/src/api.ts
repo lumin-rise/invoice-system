@@ -93,6 +93,8 @@ export const api = {
     return fetch('/api/translate/upload', { method: 'POST', body: fd }).then(r => j(r))
   },
   translateList: (): Promise<any[]> => fetch('/api/translate/list').then(r => j(r)),
+  translateContent: (id: string): Promise<any> =>
+    fetch(`/api/translate/${id}/content`).then(r => j(r)),
   translateDelete: (id: string): Promise<{ ok: boolean }> =>
     fetch(`/api/translate/${id}`, { method: 'DELETE' }).then(r => j(r)),
 }

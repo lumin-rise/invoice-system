@@ -1,46 +1,61 @@
-"""翻译引擎层：多服务商 + 内存缓存。
+"""翻译引擎：MyMemory 免费接口（无需密钥）+ 内置术语表 + 并发提速。
 
-- mymemory  MyMemory 免费接口（无需密钥，默认引擎；长句质量一般，日限 5 万字符）
-- tencent   腾讯云机器翻译 TMT（每月 500 万字符免费，国内最稳，推荐追求质量时用）
-- baidu     百度翻译开放平台（标准版每月 5 万字符免费）
-- deepl     DeepL Free（每月 50 万字符，国内网络不一定可达）
-- bing      Bing 免费接口（无需 key，国内网络大多不可达，备选）
-
-统一入口：translate_many(texts: list[str]) -> list[str]
-未配置服务商时自动使用免费的 mymemory。
+提速策略：
+1. 内置术语表：QC 单据里大量重复的固定词（Zone A、Any zone、Critical…、
+   FB01 这类代码、单个字母）直接查表或跳过，不发网络请求
+2. 翻译缓存：同一文本本次进程内只请求一次
+3. 8 线程并发请求，长句按句子边界切分到单请求 500 字符限制内
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import html
 import json
 import re
-import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from pathlib import Path
-
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import DATA_DIR
 
 CONFIG_FILE = DATA_DIR / "translate_config.json"
 
-PROVIDERS = {
-    "mymemory": "MyMemory 免费接口（无需密钥，开箱即用）",
-    "tencent": "腾讯云机器翻译（500万字/月免费，更精准）",
-    "baidu": "百度翻译开放平台（5万字/月免费）",
-    "deepl": "DeepL Free（50万字/月）",
-    "bing": "Bing 免费接口（无需 key，备选）",
+MAX_QUERY = 480          # MyMemory 单请求上限 500 字符
+WORKERS = 8              # 并发线程数
+
+# ---------------------------------------------------------------- 内置术语表
+
+GLOSSARY = {
+    "zone a": "A区", "zone b": "B区", "any zone": "任意区域",
+    "critical": "致命", "major": "严重", "minor": "轻微",
+    "critical, major, minor": "致命/严重/轻微", "major, minor": "严重/轻微",
+    "critical, major": "致命/严重", "major minor": "严重/轻微",
+    "outside": "外露处", "inside": "内侧", "inside and hidden": "内侧隐蔽处",
+    "main body": "大身", "under arm": "腋下",
+    "defect code": "缺陷代码", "description": "描述",
+    "major if found in zone a; minor if found in zone b": "A区为严重；B区为轻微",
+    "critical if found in any zone": "任意区域发现即为致命",
+    "minor if found in any zone": "任意区域均为轻微",
+    "major if found in any zone": "任意区域均为严重",
+    "apparel": "服装", "category": "类别",
+    "critical if major if": "", "others (must specify in note)": "其他（须在备注中说明）",
 }
 
-# 各引擎单次请求的字符上限
-ENGINE_LIMITS = {"mymemory": 480, "tencent": 1800, "baidu": 1800, "deepl": 1800, "bing": 1800}
-DEFAULT_PROVIDER = "mymemory"
+# 完全不需要翻译的文本（代码、编号、单个字母等）
+_SKIP_RE = re.compile(r"^(?:[A-Z]{1,3}\d{1,4}[A-Za-z]?|[A-Z]|[a-z]|\d+(?:\.\d+)?[\"''”″]?|[/\-.•…,+&%()\s]*)$")
 
-_cache: dict[str, str] = {}
+
+def is_translatable(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or not re.search(r"[A-Za-z]", t):
+        return False
+    if _SKIP_RE.match(t):
+        return False
+    return True
+
+
+def lookup(text: str) -> str | None:
+    """术语表精确命中（忽略大小写/首尾空白），未命中返回 None。"""
+    return GLOSSARY.get((text or "").strip().lower())
 
 
 # ---------------------------------------------------------------- 配置
@@ -49,130 +64,44 @@ def load_config() -> dict:
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return {"provider": "", "keys": {}}
+        return {"email": ""}
 
 
 def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 
 
-def mask(v: str) -> str:
-    if not v:
-        return ""
-    return v[:4] + "****" + v[-4:] if len(v) > 8 else "****"
-
-
 def config_summary() -> dict:
     cfg = load_config()
-    keys = {k: {kk: mask(vv) for kk, vv in v.items()} for k, v in cfg.get("keys", {}).items()}
-    return {"provider": cfg.get("provider", ""), "providers": PROVIDERS, "keys": keys}
+    return {"engine": "mymemory", "email": cfg.get("email", ""),
+            "daily_limit": "50000 字符/天（填邮箱后）", "free": True}
 
 
-def _key(cfg: dict, provider: str, name: str) -> str:
-    return cfg.get("keys", {}).get(provider, {}).get(name, "")
+def save_config_from(body: dict) -> dict:
+    cfg = {"email": str(body.get("email", "")).strip()}
+    save_config(cfg)
+    return config_summary()
 
 
-# ---------------------------------------------------------------- 各引擎
+# ---------------------------------------------------------------- MyMemory 请求
 
-def _post_json(url: str, body, headers: dict, timeout: int = 15):
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8") if isinstance(body, (list, dict)) else body,
-        headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def _tencent(texts: list[str], cfg: dict) -> list[str]:
-    """腾讯云 TMT v3（TC3-HMAC-SHA256 签名）。"""
-    sid = _key(cfg, "tencent", "secret_id")
-    skey = _key(cfg, "tencent", "secret_key")
-    service, host = "tmt", "tmt.tencentcloudapi.com"
-    out: list[str] = []
-    for text in texts:
-        payload = json.dumps({"SourceText": text, "Source": "en", "Target": "zh",
-                              "ProjectId": 0}, ensure_ascii=False)
-        ts = int(time.time())
-        date = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-        canonical = ("POST\n/\n\n"
-                     f"content-type:application/json; charset=utf-8\n"
-                     f"host:{host}\nx-tc-action:texttranslate\n"
-                     f"\ncontent-type;host;x-tc-action\n{payload}")
-        scope = f"{date}/{service}/tc3_request"
-        h2 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        k_date = hmac.new(f"TC3{skey}".encode(), date.encode(), hashlib.sha256).digest()
-        k_srv = hmac.new(k_date, service.encode(), hashlib.sha256).digest()
-        k_sign = hmac.new(k_srv, b"tc3_request", hashlib.sha256).digest()
-        signature = hmac.new(k_sign, h2.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Host": host,
-            "X-TC-Action": "TextTranslate", "X-TC-Version": "2018-03-21",
-            "X-TC-Timestamp": str(ts), "X-TC-Signature": signature,
-            "Authorization": (f"TC3-HMAC-SHA256 Credential={sid}/{scope}, "
-                              f"SignedHeaders=content-type;host;x-tc-action, Signature={signature}"),
-        }
-        data = _post_json(f"https://{host}", payload, headers)
-        resp = data.get("Response", {})
-        if "Error" in resp:
-            raise RuntimeError(f"腾讯翻译: {resp['Error'].get('Code')} {resp['Error'].get('Message')}")
-        out.append(resp["TargetText"])
-        time.sleep(0.12)        # 免费档限频 5 QPS
-    return out
-
-
-def _baidu(texts: list[str], cfg: dict) -> list[str]:
-    appid = _key(cfg, "baidu", "app_id")
-    key = _key(cfg, "baidu", "app_key")
-    out = []
-    for text in texts:
-        salt = str(int(time.time()))
-        sign = hashlib.md5((appid + text + salt + key).encode("utf-8")).hexdigest()
-        q = urllib.parse.urlencode({"q": text, "from": "en", "to": "zh",
-                                    "appid": appid, "salt": salt, "sign": sign})
-        req = urllib.request.Request("https://fanyi-api.baidu.com/api/trans/vip/translate?" + q)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        if data.get("error_code"):
-            raise RuntimeError(f"百度翻译: {data['error_code']} {data.get('error_msg')}")
-        out.append("".join(part["dst"] for part in data["trans_result"]))
-        time.sleep(0.35)        # 免费档限频
-    return out
-
-
-def _deepl(texts: list[str], cfg: dict) -> list[str]:
-    key = _key(cfg, "deepl", "api_key")
-    host = "api-free.deepl.com" if key.endswith(":fx") else "api.deepl.com"
-    data = _post_json(f"https://{host}/v2/translate",
-                      {"text": texts, "target_lang": "ZH"},
-                      {"Authorization": f"DeepL-Auth-Key {key}",
-                       "Content-Type": "application/json"})
-    return [t["text"] for t in data["translations"]]
-
-
-def _bing(texts: list[str], cfg: dict) -> list[str]:
-    data = _post_json("https://api.edge.microsoft.com/translate/translate?from=en&to=zh-Hans",
-                      [{"Text": t} for t in texts],
-                      {"Content-Type": "application/json"})
-    return [d["translations"][0]["text"] for d in data]
-
-
-def _mymemory_one(text: str, email: str) -> str:
+def _mm_once(text: str, email: str) -> str:
     params = {"langpair": "en|zh-CN", "q": text}
     if email:
-        params["de"] = email          # 提供邮箱可将每日免费额度提升到 5 万字符
+        params["de"] = email
     url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=20) as r:
+    with urllib.request.urlopen(url, timeout=25) as r:
         data = json.loads(r.read().decode("utf-8"))
     if data.get("responseStatus") != 200 or data.get("quotaFinished"):
-        raise RuntimeError(f"MyMemory: {data.get('responseDetails') or '配额或请求受限'}")
+        raise RuntimeError(f"MyMemory 接口受限：{data.get('responseDetails') or '今日免费额度已用完'}")
     return html.unescape(data["responseData"]["translatedText"])
 
 
-def _split_long(text: str, limit: int) -> list[str]:
+def _split_long(text: str, limit: int = MAX_QUERY) -> list[str]:
     if len(text) <= limit:
         return [text]
     parts, cur = [], ""
-    for seg in re.split(r"(?<=[.。;;!!？？])", text):
+    for seg in re.split(r"(?<=[.。;;!!？？])\s*", text):
         if not seg:
             continue
         if len(cur) + len(seg) <= limit:
@@ -186,67 +115,64 @@ def _split_long(text: str, limit: int) -> list[str]:
     return parts or [text[:limit]]
 
 
-def _mymemory(texts: list[str], cfg: dict) -> list[str]:
-    """单请求限 500 字符 → 逐段请求 + 4 线程并发。"""
-    email = _key(cfg, "mymemory", "email")
-    jobs = []
-    for t in texts:
-        jobs.extend(_split_long(t, 480))
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        parts = list(pool.map(lambda s: _mymemory_one(s, email), jobs))
-    # 按切分前的分段合并
-    out, idx = [], 0
-    for t in texts:
-        n = len(_split_long(t, 480))
-        out.append(" ".join(parts[idx:idx + n]))
-        idx += n
-    return out
-
-
-ENGINES = {"mymemory": _mymemory, "tencent": _tencent, "baidu": _baidu,
-           "deepl": _deepl, "bing": _bing}
-
-
-def _chunks(texts: list[str], limit: int = 1800):
-    """按字符长度分批（各引擎单请求都有上限）。"""
-    batch, size = [], 0
-    for t in texts:
-        n = min(len(t), limit)
-        if batch and size + n > limit:
-            yield batch
-            batch, size = [], 0
-        batch.append(t)
-        size += n
-    if batch:
-        yield batch
+_cache: dict[str, str] = {}
+_pool = ThreadPoolExecutor(max_workers=WORKERS)
 
 
 def translate_many(texts: list[str]) -> list[str]:
-    """批量翻译（去重 + 缓存 + 分批调用）。texts 与返回一一对应。"""
-    cfg = load_config()
-    provider = cfg.get("provider") or DEFAULT_PROVIDER
-    if provider not in ENGINES:
-        raise RuntimeError(f"未知的服务商: {provider}")
+    """批量翻译，返回与输入一一对应的中文（含术语表命中与缓存）。"""
+    email = load_config().get("email", "")
+    todo: list[str] = []
+    seen: set[str] = set()
+    for t in texts:
+        t = t.strip()
+        if not _needs_translation_remote(t) or t in seen:
+            continue
+        seen.add(t)
+        if t not in _cache:
+            todo.append(t)
 
-    uniq = list(dict.fromkeys(t for t in texts if t.strip()))
-    todo = [t for t in uniq if t not in _cache]
-
-    engine = ENGINES[provider]
-    for batch in _chunks(todo, ENGINE_LIMITS.get(provider, 1800)):
-        result = engine(batch, cfg)
-        if len(result) != len(batch):
-            raise RuntimeError(f"翻译服务返回条数不符（{len(batch)}→{len(result)}）")
-        for src, dst in zip(batch, result):
+    if todo:
+        jobs: list[str] = []
+        for t in todo:
+            jobs.extend(_split_long(t))
+        parts = list(_pool.map(lambda s: _mm_once(s, email), jobs))
+        merged, idx = [], 0
+        for t in todo:
+            n = len(_split_long(t))
+            merged.append(" ".join(parts[idx:idx + n]))
+            idx += n
+        for src, dst in zip(todo, merged):
             _cache[src] = dst
-    return [_cache.get(t, t) if t.strip() else t for t in texts]
+
+    out = []
+    for t in texts:
+        s = t.strip()
+        if not s:
+            out.append(t)
+            continue
+        g = lookup(s)
+        if g is not None:
+            out.append(g)
+        else:
+            out.append(_cache.get(s, s))
+    return out
+
+
+def _needs_translation_remote(t: str) -> bool:
+    t = (t or "").strip()
+    if not t or not re.search(r"[A-Za-z]", t):
+        return False
+    if _SKIP_RE.match(t):
+        return False
+    if t.lower() in GLOSSARY:
+        return False
+    return True
 
 
 def test_engine() -> dict:
-    cfg = load_config()
-    provider = cfg.get("provider") or DEFAULT_PROVIDER
-    sample = ["Quality defect classification standard"]
     try:
-        out = translate_many(sample)
-        return {"ok": True, "provider": provider, "sample": out[0]}
+        out = translate_many(["Quality defect classification standard"])
+        return {"ok": True, "engine": "mymemory", "sample": out[0]}
     except Exception as e:
-        return {"ok": False, "provider": provider, "msg": str(e)}
+        return {"ok": False, "engine": "mymemory", "msg": str(e)}
